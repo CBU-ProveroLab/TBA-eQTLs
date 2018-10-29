@@ -1,7 +1,8 @@
 #!/usr/bin/Rscript
-
 # Script that starting from the TBA matrix and the covariates fits the PCR models.
-# library that implements the ddply function
+
+# Library that implements the ddply function
+.libPaths("/mnt/red/elly/bioinfotree/binary/tungsteno/local/lib/R")
 library("plyr")
 
 # set.seed initializes the generation of random numbers setting the starting value
@@ -11,7 +12,7 @@ set.seed(42)
 
 # load all arguments in a vector
 args<-commandArgs(TRUE)
-# matrix with predictors (TBA on which the PCA must be done) and predicted values (expression)
+# TBA matrix with predictors (TBA on which the PCA must be done) and predicted values (expression)
 data_file<-args[1]
 # matrix with covariates
 cov_file<-args[2]
@@ -23,40 +24,42 @@ target<-args[4]
 n_perm<-args[5]
 
 # open files
-# we expect to have a 'sample' column in both files (with the same set of sample identifiers!)
-# that is used to combine the covariates with the right individual.
-# we expect to also have 'gene' and 'expression' columns in the TBA matrix.
+# in the TBA matrix we expect to have an 'id' column with sample identifiers, gene names and region names, separated by underscores
+# in addition we expect to have an 'expression' columns in the TBA matrix and a 'sample' column in the covariates matrix
+# pay attention: in the TBA matrix each block refers to a gene_region pair and all of them must be sorted according to samples identifiers
+
 data<-read.table(data_file, header=TRUE, sep="\t", stringsAsFactors=FALSE, comment.char="")
+
 # all the provided covariates must be included in the null-model that is the same for all comparisons
 all.cov<-read.table(cov_file, header=TRUE, sep="\t", stringsAsFactors = FALSE, comment.char = "")
 all.cov <- all.cov[order(all.cov$sample),]
 
-# check samples correspondence
-gene1 <- data[1,"gene"]
-inds_tba <- data[data$gene==gene1,"sample"]
-if (!all(inds_tba == all.cov$sample)) {
+# check that the order of the samples is the same in each block of the TBA matrix and in covariates matrix
+ids<-as.data.frame(do.call(rbind, strsplit(data$id, split="_")))
+gene1 <- as.character(ids[1,2])
+samples_tba <- as.character(ids[ids$V2==gene1,]$V1)
+if (!all(samples_tba == all.cov$sample)) {
   stop("We need to have the same sample identifiers for individuals in the TBA and covariate matrix!")
 }
 
 all.cov$sample <- NULL
-data$sample <- NULL
+data$id <- paste0(ids$V2,"_",ids$V3)
 
 formula<-as.formula("expression~.")
 
 # function that is evocated recursively by ddply to make models for all genes
 all_models<-function(data, all.cov, formula, target){
-  gene<-unique(data[,1])
-  # elimination of the column with the geneid
-  data$gene <- NULL
+  
+  # elimination of the column with the id
+  data$id <- NULL
+  
   # separation of the predictors and the predicted values
-  # subset must be used to obtain a new data.frame in output also when only one column is selected!
   tba<-subset(data, select=-c(expression))
   y<-subset(data, select = expression)
   
   # run the PCA on the TBA values for the selected gene
   tryCatch(
     {
-      # checked: the principal components obtained using prcomp are identical to the ones obtained with SVD
       prcomp<-prcomp(tba)
       pca.tba<-prcomp$x
       # compute the eigenvalue of each PC and the corresponding percentage of variance explained
@@ -73,10 +76,11 @@ all_models<-function(data, all.cov, formula, target){
   )
   
   if(length(wantedpc)!=0){
+    
     # selection of the minimum number of PCs that explain the desidered percentage of variance
-    # as.data.frame is necessary here to avoid that when wantedpc=1 values collapse in a vector and colnames complains
     pca.tba.selected<-as.data.frame(pca.tba[,1:wantedpc])
     colnames(pca.tba.selected)<-paste('tPC', c(1:wantedpc), sep='')
+    
     tryCatch(
       {
         # costruction of different data.frame and fitting of models
@@ -88,12 +92,11 @@ all_models<-function(data, all.cov, formula, target){
         tba_model_data<-cbind(pca.tba.selected,all.cov,y)
         tba_model<-lm(formula=formula, data=tba_model_data)
         
-        # the covariates+TBA model must be compared with the null model (ANOVA test)
+        # the covariates+TBA model must be compared with the null model (F-test implemented by the ANOVA function)
         anova_tba<-anova(null_model, tba_model)
         anova_tba_pvalue<-anova_tba$`Pr(>F)`[2]
         
-        ## function that uses anova to compute an empirical pvalue comparing the null and the TBA model
-        ## on shuffled y values
+        # function that uses anova to compute an empirical pvalue comparing the null and the TBA model on shuffled y values
         get_perm_apval<-function(pca.data.selected, y, cov, formula){
           resample <- function(x, ...) x[sample.int(length(x), ...)]
           y_perm<-as.data.frame(resample(y))
@@ -141,21 +144,20 @@ all_models<-function(data, all.cov, formula, target){
   return(out)
 }
 
-# usare ddply per fare un modello per ogni gene
+# exploit ddply in order to fit a model for each gene_region pair
 if (n_cores > 1) {
   n_cores <- as.numeric(n_cores)
   library(doMC)
   registerDoMC(n_cores)
-  # nome della funzione seguita dagli argomenti che vogliamo passare
-  res <- ddply(.data=data, .(gene), .fun=all_models, all.cov, formula, target, .parallel = TRUE)
+  res <- ddply(.data=data, .(id), .fun=all_models, all.cov, formula, target, .parallel = TRUE)
 } else {
-  res <- ddply(.data=data, .(gene), .fun=all_models, all.cov, formula, target)
+  res <- ddply(.data=data, .(id), .fun=all_models, all.cov, formula, target)
 }
 
 if(n_perm > 0){
-  colnames(res) <- c("gene","pvalue", "empirical_pvalue")
+  colnames(res) <- c("id","pvalue", "empirical_pvalue")
 } else {
-  colnames(res) <- c("gene","pvalue")
+  colnames(res) <- c("id","pvalue")
 }
 
 write.table(res, quote=FALSE, sep="\t", row.names=FALSE)
